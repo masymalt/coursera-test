@@ -183,42 +183,62 @@ def build_intervals_from_timed_lyrics(
 def infer_chorus_intervals_from_repetition(
     timed_lines: list[TimedLyricLine], duration_sec: float
 ) -> list[SectionInterval]:
-    """Infer chorus-like intervals from repeated synchronized lyric lines.
+    """Infer chorus intervals from repeated timed lyric phrases.
 
-    Useful when LRC has timings but no explicit section tags.
+    This path is used when timed lyrics exist, but explicit section tags are absent.
     """
     normalized: list[tuple[float, str]] = []
     for line in timed_lines:
         token = normalize_lyric_text(line.text)
-        if token and len(token) >= 8:
+        # Avoid very short / noisy anchors.
+        if token and len(token) >= 10 and len(token.split()) >= 3:
             normalized.append((line.time_sec, token))
     if not normalized:
         return []
 
-    counts: dict[str, int] = {}
-    for _, token in normalized:
-        counts[token] = counts.get(token, 0) + 1
+    token_times: dict[str, list[float]] = {}
+    for time_sec, token in normalized:
+        token_times.setdefault(token, []).append(time_sec)
 
-    repeated_anchor_times = sorted(
-        [time_sec for time_sec, token in normalized if counts.get(token, 0) >= 2]
-    )
-    if len(repeated_anchor_times) < 2:
+    # Keep phrases that repeat in separated parts of the song (chorus-like behavior).
+    candidate_tokens: list[tuple[str, list[float], float]] = []
+    for token, times in token_times.items():
+        if len(times) < 2:
+            continue
+        span = max(times) - min(times)
+        if span < 30.0:
+            continue
+        # Favors recurring long phrases spread across the timeline.
+        score = len(times) * (1.0 + min(5.0, len(token) / 30.0)) + span / 45.0
+        candidate_tokens.append((token, times, score))
+
+    if not candidate_tokens:
         return []
 
-    groups: list[list[float]] = [[repeated_anchor_times[0]]]
-    for time_sec in repeated_anchor_times[1:]:
-        if time_sec - groups[-1][-1] <= 14.0:
+    candidate_tokens.sort(key=lambda item: item[2], reverse=True)
+    top_tokens = candidate_tokens[:8]
+
+    anchors = sorted(time_sec for _, times, _ in top_tokens for time_sec in times)
+    if len(anchors) < 4:
+        return []
+
+    groups: list[list[float]] = [[anchors[0]]]
+    for time_sec in anchors[1:]:
+        if time_sec - groups[-1][-1] <= 15.0:
             groups[-1].append(time_sec)
         else:
             groups.append([time_sec])
 
+    # Chorus typically appears in >=2 distant groups.
+    dense_groups = [group for group in groups if len(group) >= 2]
+    if len(dense_groups) < 2:
+        return []
+
     intervals: list[SectionInterval] = []
-    for group in groups:
-        if len(group) < 2:
-            continue
-        start = max(0.0, group[0] - 2.0)
-        end = min(duration_sec, group[-1] + 10.0)
-        if end - start >= 8.0:
+    for group in dense_groups:
+        start = max(0.0, group[0] - 3.0)
+        end = min(duration_sec, group[-1] + 8.0)
+        if end - start >= 10.0:
             intervals.append(SectionInterval(start=start, end=end, label="chorus"))
     return intervals
 
@@ -428,8 +448,10 @@ def apply_audio_only_labels(segments: list[AudioSegment]) -> None:
     repeated = [cid for cid, st in stats.items() if st["occ"] >= 2]
     chorus_cluster: int | None = None
     verse_cluster: int | None = None
+    dominant_cluster_ratio = max((st["occ"] for st in stats.values()), default=0) / max(1, len(segments))
+    degenerate_clustering = len(stats) <= 2 and dominant_cluster_ratio >= 0.85
 
-    if repeated:
+    if repeated and not degenerate_clustering:
         occ = np.array([stats[c]["occ"] for c in repeated], dtype=float)
         ene = np.array([stats[c]["mean_energy"] for c in repeated], dtype=float)
         dur = np.array([stats[c]["dur"] for c in repeated], dtype=float)
