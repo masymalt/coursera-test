@@ -1,0 +1,1182 @@
+#!/usr/bin/env python3
+"""Audio structure + internet lyrics pipeline.
+
+Pipeline:
+1) Segment the song into structural blocks from audio.
+2) Fetch lyrics from the internet (LRCLIB first, lyrics.ovh fallback).
+3) If timed lyrics with section tags are available, use them for labeling.
+4) If only plain lyrics with [Verse]/[Chorus] tags are available, align by sequence.
+5) Export markers (CSV + CUE) and a structure plot.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+from urllib.parse import quote
+
+import librosa
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+import requests
+from sklearn.cluster import KMeans
+from sklearn.metrics import silhouette_score
+from sklearn.preprocessing import StandardScaler
+
+SECTION_ALIASES = {
+    "verse": "verse",
+    "куплет": "verse",
+    "chorus": "chorus",
+    "hook": "chorus",
+    "refrain": "chorus",
+    "припев": "chorus",
+    "pre-chorus": "pre_chorus",
+    "pre chorus": "pre_chorus",
+    "bridge": "bridge",
+    "бридж": "bridge",
+    "intro": "intro",
+    "outro": "outro",
+}
+
+
+@dataclass
+class TimedLyricLine:
+    time_sec: float
+    text: str
+
+
+@dataclass
+class SectionInterval:
+    start: float
+    end: float
+    label: str
+
+
+@dataclass
+class AudioSegment:
+    start: float
+    end: float
+    duration: float
+    vec: np.ndarray
+    energy: float
+    cluster: int = -1
+    pattern: str = ""
+    label: str = "section"
+    label_source: str = "audio"
+
+
+def choose_num_segments(duration_sec: float) -> int:
+    k = int(round(duration_sec / 20.0))
+    return int(np.clip(k, 5, 14))
+
+
+def sec_to_cue(seconds: float) -> str:
+    total_frames = int(round(seconds * 75))
+    mm = total_frames // (60 * 75)
+    ss = (total_frames // 75) % 60
+    ff = total_frames % 75
+    return f"{mm:02d}:{ss:02d}:{ff:02d}"
+
+
+def sec_to_mmss_mmm(seconds: float) -> str:
+    mm = int(seconds // 60)
+    ss = int(seconds % 60)
+    ms = int(round((seconds - int(seconds)) * 1000))
+    if ms == 1000:
+        ss += 1
+        ms = 0
+    if ss >= 60:
+        mm += 1
+        ss -= 60
+    return f"{mm:02d}:{ss:02d}.{ms:03d}"
+
+
+def normalize_rows(x: np.ndarray) -> np.ndarray:
+    scaler = StandardScaler()
+    return scaler.fit_transform(x.T).T
+
+
+def parse_filename_metadata(audio_path: Path) -> tuple[str | None, str | None]:
+    stem = audio_path.stem.strip()
+    if " - " not in stem:
+        return None, None
+    artist, title = stem.split(" - ", 1)
+    artist = artist.strip() or None
+    title = title.strip() or None
+    return artist, title
+
+
+def canonical_section_label(raw: str) -> str | None:
+    token = raw.strip().lower()
+    token = token.replace("_", " ").replace("—", "-")
+    token = re.sub(r"\s+", " ", token)
+    for key, value in SECTION_ALIASES.items():
+        if token.startswith(key):
+            return value
+    return None
+
+
+def extract_section_label_from_line(text: str) -> str | None:
+    # Examples: [Verse], (Chorus), Verse 2:
+    bracket_match = re.search(r"[\[\(]\s*([a-zA-Zа-яА-Я\- ]{3,20})\s*[\]\)]", text)
+    if bracket_match:
+        label = canonical_section_label(bracket_match.group(1))
+        if label:
+            return label
+
+    colon_match = re.match(r"^\s*([a-zA-Zа-яА-Я\- ]{3,20})\s*:\s*$", text)
+    if colon_match:
+        label = canonical_section_label(colon_match.group(1))
+        if label:
+            return label
+
+    return None
+
+
+def parse_lrc_timed_lines(text: str) -> list[TimedLyricLine]:
+    lines: list[TimedLyricLine] = []
+    timestamp_re = re.compile(r"\[(\d{1,2}):(\d{2}(?:\.\d{1,3})?)\]")
+    for raw_line in text.splitlines():
+        matches = list(timestamp_re.finditer(raw_line))
+        if not matches:
+            continue
+        lyric_text = timestamp_re.sub("", raw_line).strip()
+        for match in matches:
+            mm = int(match.group(1))
+            ss = float(match.group(2))
+            time_sec = mm * 60 + ss
+            lines.append(TimedLyricLine(time_sec=time_sec, text=lyric_text))
+    lines.sort(key=lambda x: x.time_sec)
+    return lines
+
+
+def normalize_lyric_text(text: str) -> str:
+    cleaned = text.lower()
+    cleaned = re.sub(r"[^a-z0-9а-яё\s]", " ", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    return cleaned
+
+
+def build_intervals_from_timed_lyrics(
+    timed_lines: list[TimedLyricLine], duration_sec: float
+) -> list[SectionInterval]:
+    starts: list[tuple[float, str]] = []
+    for line in timed_lines:
+        label = extract_section_label_from_line(line.text)
+        if label:
+            starts.append((line.time_sec, label))
+    if not starts:
+        return []
+
+    intervals: list[SectionInterval] = []
+    for idx, (start, label) in enumerate(starts):
+        end = starts[idx + 1][0] if idx + 1 < len(starts) else duration_sec
+        if end > start:
+            intervals.append(SectionInterval(start=start, end=end, label=label))
+    return intervals
+
+
+def infer_chorus_intervals_from_repetition(
+    timed_lines: list[TimedLyricLine], duration_sec: float
+) -> list[SectionInterval]:
+    """Infer chorus intervals from repeated timed lyric phrases.
+
+    This path is used when timed lyrics exist, but explicit section tags are absent.
+    """
+    normalized: list[tuple[float, str]] = []
+    for line in timed_lines:
+        token = normalize_lyric_text(line.text)
+        # Avoid very short / noisy anchors.
+        if token and len(token) >= 10 and len(token.split()) >= 3:
+            normalized.append((line.time_sec, token))
+    if not normalized:
+        return []
+
+    token_times: dict[str, list[float]] = {}
+    for time_sec, token in normalized:
+        token_times.setdefault(token, []).append(time_sec)
+
+    # Keep phrases that repeat in separated parts of the song (chorus-like behavior).
+    candidate_tokens: list[tuple[str, list[float], float]] = []
+    for token, times in token_times.items():
+        if len(times) < 2:
+            continue
+        span = max(times) - min(times)
+        if span < 30.0:
+            continue
+        # Favors recurring long phrases spread across the timeline.
+        score = len(times) * (1.0 + min(5.0, len(token) / 30.0)) + span / 45.0
+        candidate_tokens.append((token, times, score))
+
+    if not candidate_tokens:
+        return []
+
+    candidate_tokens.sort(key=lambda item: item[2], reverse=True)
+    top_tokens = candidate_tokens[:8]
+
+    anchors = sorted(time_sec for _, times, _ in top_tokens for time_sec in times)
+    if len(anchors) < 4:
+        return []
+
+    groups: list[list[float]] = [[anchors[0]]]
+    for time_sec in anchors[1:]:
+        if time_sec - groups[-1][-1] <= 15.0:
+            groups[-1].append(time_sec)
+        else:
+            groups.append([time_sec])
+
+    # Chorus typically appears in >=2 distant groups.
+    dense_groups = [group for group in groups if len(group) >= 2]
+    if len(dense_groups) < 2:
+        return []
+
+    intervals: list[SectionInterval] = []
+    for group in dense_groups:
+        start = max(0.0, group[0] - 3.0)
+        end = min(duration_sec, group[-1] + 8.0)
+        if end - start >= 10.0:
+            intervals.append(SectionInterval(start=start, end=end, label="chorus"))
+    return intervals
+
+
+def build_lyric_presence_intervals(
+    timed_lines: list[TimedLyricLine], duration_sec: float
+) -> list[SectionInterval]:
+    non_empty = [line for line in timed_lines if normalize_lyric_text(line.text)]
+    if not non_empty:
+        return []
+
+    intervals: list[SectionInterval] = []
+    for idx, line in enumerate(non_empty):
+        next_time = non_empty[idx + 1].time_sec if idx + 1 < len(non_empty) else duration_sec
+        gap = max(1.0, min(8.0, next_time - line.time_sec))
+        end = min(duration_sec, line.time_sec + gap)
+        if end > line.time_sec:
+            intervals.append(SectionInterval(start=line.time_sec, end=end, label="voice"))
+    return intervals
+
+
+def extract_section_sequence_from_plain_lyrics(text: str) -> list[str]:
+    seq: list[str] = []
+    for line in text.splitlines():
+        label = extract_section_label_from_line(line.strip())
+        if label and (not seq or seq[-1] != label):
+            seq.append(label)
+    return seq
+
+
+def fetch_lrclib(
+    artist: str, title: str, duration_sec: float | None = None
+) -> dict[str, Any] | None:
+    base_url = "https://lrclib.net/api"
+    with requests.Session() as session:
+        try:
+            params = {"artist_name": artist, "track_name": title}
+            if duration_sec is not None:
+                params["duration"] = str(int(round(duration_sec)))
+            response = session.get(f"{base_url}/get", params=params, timeout=12)
+            if response.ok:
+                payload = response.json()
+                if isinstance(payload, dict) and (
+                    payload.get("syncedLyrics") or payload.get("plainLyrics")
+                ):
+                    payload["_provider"] = "lrclib"
+                    return payload
+        except requests.RequestException:
+            pass
+
+        try:
+            response = session.get(
+                f"{base_url}/search",
+                params={"artist_name": artist, "track_name": title},
+                timeout=12,
+            )
+            if not response.ok:
+                return None
+            items = response.json()
+            if not isinstance(items, list) or not items:
+                return None
+
+            def score(item: dict[str, Any]) -> tuple[float, int]:
+                name_bonus = 0.0
+                candidate_title = str(item.get("trackName", "")).lower()
+                candidate_artist = str(item.get("artistName", "")).lower()
+                if title.lower() in candidate_title:
+                    name_bonus += 2.0
+                if artist.lower() in candidate_artist:
+                    name_bonus += 2.0
+                duration_penalty = 0.0
+                if duration_sec is not None and item.get("duration"):
+                    duration_penalty = abs(float(item["duration"]) - duration_sec) / 30.0
+                return (name_bonus - duration_penalty, 1 if item.get("syncedLyrics") else 0)
+
+            best = sorted(items, key=score, reverse=True)[0]
+            if best.get("syncedLyrics") or best.get("plainLyrics"):
+                best["_provider"] = "lrclib"
+                return best
+        except requests.RequestException:
+            return None
+    return None
+
+
+def fetch_lyrics_ovh(artist: str, title: str) -> dict[str, Any] | None:
+    try:
+        url = f"https://api.lyrics.ovh/v1/{requests.utils.quote(artist)}/{requests.utils.quote(title)}"
+        response = requests.get(url, timeout=12)
+        if not response.ok:
+            return None
+        payload = response.json()
+        lyrics = payload.get("lyrics")
+        if lyrics and isinstance(lyrics, str):
+            return {"plainLyrics": lyrics, "_provider": "lyrics.ovh"}
+    except requests.RequestException:
+        return None
+    return None
+
+
+def cluster_segments(segment_vectors: np.ndarray) -> np.ndarray:
+    n = len(segment_vectors)
+    if n <= 2:
+        return np.arange(n)
+    max_k = min(6, n - 1)
+    best_labels: np.ndarray | None = None
+    best_score = -1.0
+    for k in range(2, max_k + 1):
+        model = KMeans(n_clusters=k, n_init=20, random_state=42)
+        labels = model.fit_predict(segment_vectors)
+        if len(set(labels)) < 2:
+            continue
+        score = silhouette_score(segment_vectors, labels)
+        if score > best_score:
+            best_score = score
+            best_labels = labels
+    return best_labels if best_labels is not None else np.arange(n)
+
+
+def detect_audio_segments(audio_path: Path) -> tuple[np.ndarray, int, float, list[AudioSegment]]:
+    y, sr = librosa.load(str(audio_path), sr=22050, mono=True)
+    duration_sec = float(librosa.get_duration(y=y, sr=sr))
+    hop = 512
+
+    chroma = librosa.feature.chroma_cqt(y=y, sr=sr, hop_length=hop)
+    mfcc = librosa.feature.mfcc(y=y, sr=sr, n_mfcc=13, hop_length=hop)
+    rms = librosa.feature.rms(y=y, hop_length=hop)
+    centroid = librosa.feature.spectral_centroid(y=y, sr=sr, hop_length=hop)
+
+    feats = np.vstack([chroma, mfcc, np.log1p(rms), np.log1p(centroid)])
+    feats = normalize_rows(feats)
+
+    _, beats = librosa.beat.beat_track(y=y, sr=sr, hop_length=hop, trim=False)
+    beats = np.asarray(beats, dtype=int)
+    if len(beats) < 8:
+        step = max(1, feats.shape[1] // 200)
+        beats = np.arange(0, feats.shape[1], step, dtype=int)
+    if beats[0] != 0:
+        beats = np.r_[0, beats]
+    if beats[-1] != feats.shape[1] - 1:
+        beats = np.r_[beats, feats.shape[1] - 1]
+
+    feats_sync = librosa.util.sync(feats, beats, aggregate=np.median)
+    rms_sync = librosa.util.sync(rms, beats, aggregate=np.mean).squeeze()
+    k_segments = choose_num_segments(duration_sec)
+    boundaries = librosa.segment.agglomerative(feats_sync, k=k_segments)
+    boundaries = np.unique(np.asarray(boundaries, dtype=int))
+    boundaries = boundaries[(boundaries >= 0) & (boundaries < feats_sync.shape[1])]
+    if len(boundaries) == 0 or boundaries[0] != 0:
+        boundaries = np.r_[0, boundaries]
+    if boundaries[-1] != feats_sync.shape[1] - 1:
+        boundaries = np.r_[boundaries, feats_sync.shape[1] - 1]
+
+    segments: list[AudioSegment] = []
+    for idx in range(len(boundaries) - 1):
+        b_start = int(boundaries[idx])
+        b_end = int(max(boundaries[idx + 1], b_start + 1))
+        frame_start = int(beats[b_start])
+        frame_end = int(beats[b_end])
+        start = float(librosa.frames_to_time(frame_start, sr=sr, hop_length=hop))
+        end = float(librosa.frames_to_time(frame_end, sr=sr, hop_length=hop))
+        if end <= start:
+            continue
+        vec = feats_sync[:, b_start:b_end].mean(axis=1)
+        energy = float(np.mean(rms_sync[b_start:b_end])) if b_end > b_start else float(rms_sync[b_start])
+        segments.append(
+            AudioSegment(
+                start=start,
+                end=end,
+                duration=end - start,
+                vec=vec,
+                energy=energy,
+            )
+        )
+
+    if len(segments) < 2:
+        raise RuntimeError("Too few segments detected from audio.")
+
+    segment_vectors = np.vstack([s.vec for s in segments])
+    cluster_ids = cluster_segments(segment_vectors)
+    seen: list[int] = []
+    for cid in cluster_ids:
+        if int(cid) not in seen:
+            seen.append(int(cid))
+    cid_to_pattern = {
+        cid: (chr(ord("A") + i) if i < 26 else f"S{i+1}")
+        for i, cid in enumerate(seen)
+    }
+    for segment, cid in zip(segments, cluster_ids):
+        segment.cluster = int(cid)
+        segment.pattern = cid_to_pattern[int(cid)]
+
+    return y, sr, duration_sec, segments
+
+
+def apply_audio_only_labels(segments: list[AudioSegment]) -> None:
+    stats: dict[int, dict[str, Any]] = {}
+    for seg in segments:
+        st = stats.setdefault(seg.cluster, {"occ": 0, "dur": 0.0, "energies": [], "positions": []})
+        st["occ"] += 1
+        st["dur"] += seg.duration
+        st["energies"].append(seg.energy)
+        st["positions"].append(seg.start)
+
+    for st in stats.values():
+        st["mean_energy"] = float(np.mean(st["energies"]))
+
+    repeated = [cid for cid, st in stats.items() if st["occ"] >= 2]
+    chorus_cluster: int | None = None
+    verse_cluster: int | None = None
+    dominant_cluster_ratio = max((st["occ"] for st in stats.values()), default=0) / max(1, len(segments))
+    degenerate_clustering = len(stats) <= 2 and dominant_cluster_ratio >= 0.85
+
+    if repeated and not degenerate_clustering:
+        occ = np.array([stats[c]["occ"] for c in repeated], dtype=float)
+        ene = np.array([stats[c]["mean_energy"] for c in repeated], dtype=float)
+        dur = np.array([stats[c]["dur"] for c in repeated], dtype=float)
+
+        def z(values: np.ndarray) -> np.ndarray:
+            std = float(np.std(values))
+            return (values - np.mean(values)) / (std + 1e-9)
+
+        score = 1.8 * z(occ) + 1.0 * z(ene) + 0.7 * z(dur)
+        chorus_cluster = repeated[int(np.argmax(score))]
+        verse_candidates = [c for c in repeated if c != chorus_cluster]
+        if verse_candidates:
+            verse_cluster = min(verse_candidates, key=lambda c: stats[c]["mean_energy"])
+
+    last_idx = len(segments) - 1
+    for idx, seg in enumerate(segments):
+        if idx == 0 and seg.duration < 24 and stats[seg.cluster]["occ"] == 1:
+            seg.label = "intro"
+        elif idx == last_idx and seg.duration < 30 and stats[seg.cluster]["occ"] == 1:
+            seg.label = "outro"
+        elif chorus_cluster is not None and seg.cluster == chorus_cluster:
+            seg.label = "chorus"
+        elif verse_cluster is not None and seg.cluster == verse_cluster:
+            seg.label = "verse"
+        else:
+            seg.label = f"section_{seg.pattern.lower()}"
+        seg.label_source = "audio"
+
+
+def overlap_seconds(a_start: float, a_end: float, b_start: float, b_end: float) -> float:
+    return max(0.0, min(a_end, b_end) - max(a_start, b_start))
+
+
+def apply_timed_lyrics_labels(
+    segments: list[AudioSegment], intervals: list[SectionInterval], min_overlap_ratio: float = 0.2
+) -> bool:
+    if not intervals:
+        return False
+    changed = False
+    for seg in segments:
+        overlaps: list[tuple[float, str]] = []
+        for interval in intervals:
+            ov = overlap_seconds(seg.start, seg.end, interval.start, interval.end)
+            if ov > 0:
+                overlaps.append((ov, interval.label))
+        if not overlaps:
+            continue
+        best_overlap, best_label = max(overlaps, key=lambda x: x[0])
+        if best_overlap / max(seg.duration, 1e-6) >= min_overlap_ratio:
+            seg.label = best_label
+            seg.label_source = "lyrics_timed"
+            changed = True
+    return changed
+
+
+def apply_verse_labels_from_lyric_presence(
+    segments: list[AudioSegment], lyric_presence: list[SectionInterval]
+) -> bool:
+    if not lyric_presence:
+        return False
+
+    changed = False
+    for seg in segments:
+        if seg.label in {"chorus", "intro", "outro"}:
+            continue
+        overlap = sum(
+            overlap_seconds(seg.start, seg.end, interval.start, interval.end)
+            for interval in lyric_presence
+        )
+        if overlap / max(seg.duration, 1e-6) >= 0.35:
+            seg.label = "verse"
+            if seg.label_source == "audio":
+                seg.label_source = "lyrics_inferred"
+            changed = True
+    return changed
+
+
+def apply_plain_lyrics_sequence_labels(segments: list[AudioSegment], section_seq: list[str]) -> bool:
+    if not section_seq or len(segments) < 2:
+        return False
+
+    n = len(segments)
+    m = len(section_seq)
+    if m == 1:
+        dominant = section_seq[0]
+        for seg in segments:
+            seg.label = dominant
+            seg.label_source = "lyrics_sequence"
+        return True
+
+    votes: dict[int, dict[str, int]] = {}
+    for i, section_label in enumerate(section_seq):
+        mapped_index = int(round(i * (n - 1) / (m - 1)))
+        cluster = segments[mapped_index].cluster
+        cluster_votes = votes.setdefault(cluster, {})
+        cluster_votes[section_label] = cluster_votes.get(section_label, 0) + 1
+
+    cluster_to_label: dict[int, str] = {}
+    for cluster, cluster_votes in votes.items():
+        cluster_to_label[cluster] = max(cluster_votes.items(), key=lambda item: item[1])[0]
+
+    changed = False
+    for seg in segments:
+        mapped = cluster_to_label.get(seg.cluster)
+        if mapped:
+            seg.label = mapped
+            seg.label_source = "lyrics_sequence"
+            changed = True
+    return changed
+
+
+def smooth_short_islands(segments: list[AudioSegment], max_short_duration: float = 12.0) -> None:
+    labels = [s.label for s in segments]
+    for i in range(1, len(segments) - 1):
+        prev_label = labels[i - 1]
+        next_label = labels[i + 1]
+        if prev_label == next_label and labels[i] != prev_label and segments[i].duration <= max_short_duration:
+            labels[i] = prev_label
+    for seg, label in zip(segments, labels):
+        seg.label = label
+
+
+def merge_adjacent_same_labels(segments: list[AudioSegment]) -> list[AudioSegment]:
+    if not segments:
+        return []
+    merged: list[AudioSegment] = [segments[0]]
+    for current in segments[1:]:
+        prev = merged[-1]
+        if current.label == prev.label:
+            prev.end = current.end
+            prev.duration = prev.end - prev.start
+            if prev.label_source != current.label_source:
+                prev.label_source = "mixed"
+        else:
+            merged.append(current)
+    return merged
+
+
+def refine_edge_section_labels(
+    segments: list[AudioSegment],
+    intro_max_sec: float = 18.0,
+    outro_max_sec: float = 15.0,
+    short_tail_sec: float = 10.0,
+) -> None:
+    """Normalize edge labels for cleaner DAW-friendly marker output.
+
+    Rules:
+    - First generic section_* within intro_max_sec -> intro
+    - If intro is already present, the next short generic section near start -> intro
+    - Last generic section_* within outro_max_sec -> outro
+    - Very short trailing verse/pre_chorus -> outro
+    - If outro is present, very short preceding verse/pre_chorus -> outro
+    """
+    if not segments:
+        return
+
+    first = segments[0]
+    if first.label.startswith("section_") and first.end <= intro_max_sec:
+        first.label = "intro"
+        if first.label_source == "audio":
+            first.label_source = "postprocess"
+
+    if len(segments) >= 2:
+        second = segments[1]
+        if (
+            segments[0].label == "intro"
+            and second.label.startswith("section_")
+            and second.end <= intro_max_sec
+        ):
+            second.label = "intro"
+            if second.label_source == "audio":
+                second.label_source = "postprocess"
+
+    last = segments[-1]
+    if last.label.startswith("section_") and last.duration <= outro_max_sec:
+        last.label = "outro"
+        if last.label_source == "audio":
+            last.label_source = "postprocess"
+    elif last.label in {"verse", "pre_chorus"} and last.duration <= short_tail_sec:
+        last.label = "outro"
+        if last.label_source in {"audio", "lyrics_inferred"}:
+            last.label_source = "postprocess"
+
+    # Optional pass: if there is a generic section immediately before outro and it is tiny,
+    # collapse it into outro as well.
+    if len(segments) >= 2:
+        prev = segments[-2]
+        if segments[-1].label == "outro" and prev.label.startswith("section_") and prev.duration <= short_tail_sec:
+            prev.label = "outro"
+            if prev.label_source == "audio":
+                prev.label_source = "postprocess"
+        elif (
+            segments[-1].label == "outro"
+            and prev.label in {"verse", "pre_chorus"}
+            and prev.duration <= short_tail_sec
+        ):
+            prev.label = "outro"
+            if prev.label_source in {"audio", "lyrics_inferred"}:
+                prev.label_source = "postprocess"
+
+
+def plot_structure(y: np.ndarray, sr: int, segments: list[AudioSegment], output_png: Path) -> None:
+    duration_sec = len(y) / sr
+    times = np.linspace(0, duration_sec, num=len(y))
+    y_min, y_max = float(np.min(y)), float(np.max(y))
+    y_range = max(1e-6, y_max - y_min)
+
+    fig, (ax_wave, ax_labels) = plt.subplots(
+        2,
+        1,
+        figsize=(16, 4.8),
+        sharex=True,
+        gridspec_kw={"height_ratios": [5, 1], "hspace": 0.05},
+    )
+    ax_wave.plot(times, y, color="black", linewidth=0.55, alpha=0.8)
+
+    labels_order = list(dict.fromkeys(seg.label for seg in segments))
+    cmap = plt.get_cmap("tab20")
+    color_map = {label: cmap(i % 20) for i, label in enumerate(labels_order)}
+
+    # Dedicated label lane on a separate axis below the waveform.
+    for seg in segments:
+        color = color_map[seg.label]
+        ax_labels.axvspan(seg.start, seg.end, color=color, alpha=0.85, linewidth=0)
+        mid = (seg.start + seg.end) / 2.0
+        ax_labels.text(
+            mid,
+            0.5,
+            seg.label,
+            ha="center",
+            va="center",
+            fontsize=9,
+            fontweight="bold",
+            color="black",
+        )
+
+    ax_wave.set_title("Song structure (audio + lyrics)")
+    ax_wave.set_ylabel("Amplitude")
+    ax_wave.set_xlim(0, duration_sec)
+    ax_wave.set_ylim(y_min - 0.05 * y_range, y_max + 0.05 * y_range)
+    ax_wave.tick_params(labelbottom=False)
+
+    ax_labels.set_ylim(0, 1)
+    ax_labels.set_yticks([])
+    ax_labels.set_ylabel("")
+    ax_labels.set_xlabel("Time (sec)")
+    ax_labels.spines["left"].set_visible(False)
+    ax_labels.spines["right"].set_visible(False)
+    ax_labels.spines["top"].set_visible(False)
+    ax_labels.grid(False)
+
+    fig.subplots_adjust(hspace=0.05)
+    fig.savefig(output_png, dpi=160)
+    plt.close(fig)
+
+
+def write_interactive_player_html(
+    audio_path: Path, out_dir: Path, segments: list[AudioSegment], metadata: dict[str, Any]
+) -> None:
+    """Write a standalone interactive waveform player HTML."""
+    if not segments:
+        return
+
+    audio_rel = os.path.relpath(audio_path, out_dir).replace("\\", "/")
+    audio_src = quote(audio_rel, safe="/")
+
+    palette = [
+        "#7cb342",
+        "#fdd835",
+        "#26a69a",
+        "#ab47bc",
+        "#42a5f5",
+        "#ff7043",
+        "#8d6e63",
+        "#ef5350",
+    ]
+    labels = list(dict.fromkeys(seg.label for seg in segments))
+    label_colors = {label: palette[idx % len(palette)] for idx, label in enumerate(labels)}
+
+    segment_payload = [
+        {
+            "start": round(seg.start, 3),
+            "end": round(seg.end, 3),
+            "label": seg.label,
+            "source": seg.label_source,
+            "color": label_colors[seg.label],
+        }
+        for seg in segments
+    ]
+    metadata_payload = {
+        "artist": metadata.get("artist"),
+        "title": metadata.get("title"),
+        "lyrics_provider": metadata.get("lyrics_provider"),
+        "labeling_mode": metadata.get("labeling_mode"),
+    }
+
+    html = f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Structure Player - {audio_path.name}</title>
+  <style>
+    :root {{
+      --bg: #101217;
+      --panel: #191d26;
+      --text: #e7ebf3;
+      --muted: #a9b1c5;
+      --accent: #4fc3f7;
+      --border: #2a3140;
+    }}
+    body {{
+      margin: 0;
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Ubuntu, Cantarell, Noto Sans, Arial, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+    }}
+    .wrap {{
+      max-width: 1200px;
+      margin: 20px auto 40px;
+      padding: 0 16px;
+    }}
+    .panel {{
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 14px;
+      margin-bottom: 14px;
+    }}
+    h1 {{
+      margin: 0 0 10px;
+      font-size: 20px;
+    }}
+    .meta {{
+      color: var(--muted);
+      font-size: 13px;
+      margin-bottom: 10px;
+    }}
+    #waveform {{
+      width: 100%;
+      border-radius: 8px;
+      overflow: hidden;
+      background: #0f1320;
+    }}
+    .controls {{
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      margin-top: 12px;
+      flex-wrap: wrap;
+    }}
+    button {{
+      border: 1px solid var(--border);
+      background: #1f2633;
+      color: var(--text);
+      border-radius: 8px;
+      padding: 8px 12px;
+      cursor: pointer;
+    }}
+    button:hover {{
+      border-color: #3b4558;
+    }}
+    .time {{
+      color: var(--muted);
+      font-variant-numeric: tabular-nums;
+    }}
+    .section-bar {{
+      display: flex;
+      width: 100%;
+      height: 54px;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      overflow: hidden;
+      margin-top: 10px;
+      background: #111520;
+    }}
+    .section {{
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 12px;
+      font-weight: 700;
+      color: #111;
+      cursor: pointer;
+      border-right: 1px solid rgba(0,0,0,0.22);
+      user-select: none;
+      text-align: center;
+      padding: 2px 4px;
+      min-width: 20px;
+    }}
+    .section:hover {{
+      filter: brightness(1.06);
+    }}
+    .hint {{
+      margin-top: 8px;
+      color: var(--muted);
+      font-size: 12px;
+    }}
+    table {{
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 13px;
+    }}
+    th, td {{
+      border-bottom: 1px solid var(--border);
+      padding: 8px;
+      text-align: left;
+      font-variant-numeric: tabular-nums;
+    }}
+    th {{
+      color: var(--muted);
+      font-weight: 600;
+    }}
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="panel">
+      <h1>Interactive Structure Player</h1>
+      <div class="meta" id="meta"></div>
+      <div id="waveform"></div>
+      <div class="controls">
+        <button id="playPause">Play</button>
+        <button id="backward">-5s</button>
+        <button id="forward">+5s</button>
+        <span class="time"><span id="currentTime">00:00.000</span> / <span id="duration">--:--.---</span></span>
+      </div>
+      <div class="section-bar" id="sectionBar"></div>
+      <div class="hint">Click a colored section block to jump playback.</div>
+    </div>
+    <div class="panel">
+      <table>
+        <thead>
+          <tr>
+            <th>Section</th>
+            <th>Start</th>
+            <th>End</th>
+            <th>Source</th>
+          </tr>
+        </thead>
+        <tbody id="tableBody"></tbody>
+      </table>
+    </div>
+  </div>
+
+  <script src="https://unpkg.com/wavesurfer.js@7/dist/wavesurfer.min.js"></script>
+  <script>
+    const audioSrc = {json.dumps(audio_src)};
+    const segments = {json.dumps(segment_payload, ensure_ascii=False)};
+    const meta = {json.dumps(metadata_payload, ensure_ascii=False)};
+
+    const formatTime = (sec) => {{
+      if (!Number.isFinite(sec)) return "--:--.---";
+      const mm = Math.floor(sec / 60);
+      const ss = Math.floor(sec % 60);
+      const ms = Math.round((sec - Math.floor(sec)) * 1000);
+      return `${{String(mm).padStart(2, "0")}}:${{String(ss).padStart(2, "0")}}.${{String(ms).padStart(3, "0")}}`;
+    }};
+
+    const wave = WaveSurfer.create({{
+      container: "#waveform",
+      url: audioSrc,
+      waveColor: "#98a5bf",
+      progressColor: "#4fc3f7",
+      cursorColor: "#ffeb3b",
+      height: 230,
+      barWidth: 2,
+      barGap: 1,
+      normalize: true,
+      dragToSeek: true
+    }});
+
+    const playPauseButton = document.getElementById("playPause");
+    const backwardButton = document.getElementById("backward");
+    const forwardButton = document.getElementById("forward");
+    const currentTimeEl = document.getElementById("currentTime");
+    const durationEl = document.getElementById("duration");
+    const sectionBarEl = document.getElementById("sectionBar");
+    const tableBody = document.getElementById("tableBody");
+    const metaEl = document.getElementById("meta");
+
+    metaEl.textContent = `Artist: ${{meta.artist || "Unknown"}} | Title: ${{meta.title || "Unknown"}} | Provider: ${{meta.lyrics_provider || "n/a"}} | Mode: ${{meta.labeling_mode || "n/a"}}`;
+
+    const totalDuration = segments.length ? segments[segments.length - 1].end : 0;
+    const safeDuration = Math.max(totalDuration, 0.001);
+
+    const seekTo = (sec) => {{
+      if (!Number.isFinite(sec)) return;
+      const ratio = Math.max(0, Math.min(1, sec / safeDuration));
+      wave.seekTo(ratio);
+    }};
+
+    segments.forEach((segment) => {{
+      const width = Math.max(1.0, ((segment.end - segment.start) / safeDuration) * 100);
+      const block = document.createElement("div");
+      block.className = "section";
+      block.style.width = `${{width}}%`;
+      block.style.background = segment.color;
+      block.title = `${{segment.label}}  ${{formatTime(segment.start)}} - ${{formatTime(segment.end)}}`;
+      block.textContent = segment.label;
+      block.addEventListener("click", () => seekTo(segment.start));
+      sectionBarEl.appendChild(block);
+
+      const tr = document.createElement("tr");
+      tr.innerHTML = `
+        <td>${{segment.label}}</td>
+        <td>${{formatTime(segment.start)}}</td>
+        <td>${{formatTime(segment.end)}}</td>
+        <td>${{segment.source}}</td>
+      `;
+      tr.style.cursor = "pointer";
+      tr.addEventListener("click", () => seekTo(segment.start));
+      tableBody.appendChild(tr);
+    }});
+
+    playPauseButton.addEventListener("click", () => wave.playPause());
+    backwardButton.addEventListener("click", () => seekTo(Math.max(0, wave.getCurrentTime() - 5)));
+    forwardButton.addEventListener("click", () => seekTo(wave.getCurrentTime() + 5));
+
+    wave.on("ready", () => {{
+      durationEl.textContent = formatTime(wave.getDuration());
+    }});
+    wave.on("timeupdate", (t) => {{
+      currentTimeEl.textContent = formatTime(t);
+    }});
+    wave.on("play", () => {{
+      playPauseButton.textContent = "Pause";
+    }});
+    wave.on("pause", () => {{
+      playPauseButton.textContent = "Play";
+    }});
+    wave.on("finish", () => {{
+      playPauseButton.textContent = "Play";
+    }});
+  </script>
+</body>
+</html>
+"""
+    (out_dir / "structure_player.html").write_text(html, encoding="utf-8")
+
+
+def write_outputs(
+    audio_path: Path,
+    out_dir: Path,
+    segments: list[AudioSegment],
+    metadata: dict[str, Any],
+) -> None:
+    rows = []
+    for seg in segments:
+        rows.append(
+            {
+                "start_sec": round(seg.start, 3),
+                "end_sec": round(seg.end, 3),
+                "duration_sec": round(seg.duration, 3),
+                "label": seg.label,
+                "pattern": seg.pattern,
+                "cluster_id": seg.cluster,
+                "label_source": seg.label_source,
+            }
+        )
+    pd.DataFrame(rows).to_csv(out_dir / "markers.csv", index=False)
+
+    cue_lines = [
+        'PERFORMER "Unknown"',
+        f'TITLE "{audio_path.stem}"',
+        f'FILE "{audio_path.name}" {audio_path.suffix.lstrip(".").upper() or "MP3"}',
+    ]
+    for idx, seg in enumerate(segments, start=1):
+        cue_lines.append(f"  TRACK {idx:02d} AUDIO")
+        cue_lines.append(f'    TITLE "{seg.label}"')
+        cue_lines.append(f"    INDEX 01 {sec_to_cue(seg.start)}")
+    (out_dir / "markers.cue").write_text("\n".join(cue_lines), encoding="utf-8")
+
+    summary_lines = [f"Audio: {audio_path.name}", ""]
+    for seg in segments:
+        summary_lines.append(
+            f"{sec_to_mmss_mmm(seg.start)} - {sec_to_mmss_mmm(seg.end)}  {seg.label:<12} [{seg.label_source}]"
+        )
+    (out_dir / "summary.txt").write_text("\n".join(summary_lines), encoding="utf-8")
+
+    (out_dir / "lyrics_metadata.json").write_text(
+        json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    write_interactive_player_html(audio_path, out_dir, segments, metadata)
+
+
+def run_pipeline(
+    audio_path: Path,
+    out_dir: Path,
+    artist: str | None,
+    title: str | None,
+    lyrics_file: Path | None,
+    disable_web_lyrics: bool,
+) -> None:
+    y, sr, duration_sec, segments = detect_audio_segments(audio_path)
+    apply_audio_only_labels(segments)
+
+    metadata: dict[str, Any] = {
+        "artist": artist,
+        "title": title,
+        "lyrics_provider": None,
+        "timed_lyrics_found": False,
+        "section_tags_found": False,
+    }
+
+    synced_text: str | None = None
+    plain_text: str | None = None
+
+    if lyrics_file is not None:
+        text = lyrics_file.read_text(encoding="utf-8", errors="replace")
+        if lyrics_file.suffix.lower() == ".lrc":
+            synced_text = text
+        else:
+            plain_text = text
+        metadata["lyrics_provider"] = f"local:{lyrics_file.name}"
+    elif not disable_web_lyrics and artist and title:
+        payload = fetch_lrclib(artist, title, duration_sec=duration_sec)
+        if payload is None:
+            payload = fetch_lyrics_ovh(artist, title)
+        if payload:
+            synced_text = payload.get("syncedLyrics")
+            plain_text = payload.get("plainLyrics") or payload.get("lyrics")
+            metadata["lyrics_provider"] = payload.get("_provider")
+            metadata["lyrics_response"] = {
+                k: v
+                for k, v in payload.items()
+                if k in {"trackName", "artistName", "albumName", "duration", "_provider"}
+            }
+
+    used_lyrics = False
+    if synced_text:
+        timed_lines = parse_lrc_timed_lines(synced_text)
+        timed_intervals = build_intervals_from_timed_lyrics(timed_lines, duration_sec)
+        metadata["timed_lyrics_found"] = bool(timed_lines)
+        metadata["section_tags_found"] = bool(timed_intervals)
+        if timed_intervals:
+            if apply_timed_lyrics_labels(segments, timed_intervals):
+                used_lyrics = True
+        elif timed_lines:
+            chorus_intervals = infer_chorus_intervals_from_repetition(timed_lines, duration_sec)
+            if chorus_intervals and apply_timed_lyrics_labels(segments, chorus_intervals):
+                used_lyrics = True
+                metadata["section_tags_found"] = True
+                metadata["inferred_sections_from_repetition"] = True
+            lyric_presence = build_lyric_presence_intervals(timed_lines, duration_sec)
+            if apply_verse_labels_from_lyric_presence(segments, lyric_presence):
+                used_lyrics = True
+
+    if not used_lyrics and plain_text:
+        section_seq = extract_section_sequence_from_plain_lyrics(plain_text)
+        metadata["section_tags_found"] = bool(section_seq)
+        if apply_plain_lyrics_sequence_labels(segments, section_seq):
+            used_lyrics = True
+
+    smooth_short_islands(segments)
+    segments = merge_adjacent_same_labels(segments)
+    refine_edge_section_labels(segments)
+    segments = merge_adjacent_same_labels(segments)
+
+    if used_lyrics:
+        metadata["labeling_mode"] = "audio+lyrics"
+    else:
+        metadata["labeling_mode"] = "audio-only"
+
+    plot_structure(y, sr, segments, out_dir / "structure.png")
+    write_outputs(audio_path, out_dir, segments, metadata)
+
+
+def build_arg_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Find song sections and label them using audio + internet lyrics."
+    )
+    parser.add_argument("audio", type=str, help="Path to audio file (mp3/wav/flac)")
+    parser.add_argument("--out-dir", type=str, default="analysis_out", help="Output directory")
+    parser.add_argument("--artist", type=str, default=None, help="Artist name (for lyrics search)")
+    parser.add_argument("--title", type=str, default=None, help="Track title (for lyrics search)")
+    parser.add_argument(
+        "--lyrics-file",
+        type=str,
+        default=None,
+        help="Optional local .lrc/.txt file with lyrics and section tags",
+    )
+    parser.add_argument(
+        "--disable-web-lyrics",
+        action="store_true",
+        help="Disable internet lyrics fetching and use audio only (or --lyrics-file)",
+    )
+    return parser
+
+
+def main() -> None:
+    parser = build_arg_parser()
+    args = parser.parse_args()
+
+    audio_path = Path(args.audio).expanduser().resolve()
+    if not audio_path.exists():
+        raise FileNotFoundError(f"Audio file not found: {audio_path}")
+
+    out_dir = Path(args.out_dir).expanduser().resolve()
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    artist = args.artist
+    title = args.title
+    if not artist or not title:
+        inferred_artist, inferred_title = parse_filename_metadata(audio_path)
+        artist = artist or inferred_artist
+        title = title or inferred_title
+
+    lyrics_file = Path(args.lyrics_file).expanduser().resolve() if args.lyrics_file else None
+    if lyrics_file and not lyrics_file.exists():
+        raise FileNotFoundError(f"Lyrics file not found: {lyrics_file}")
+
+    run_pipeline(
+        audio_path=audio_path,
+        out_dir=out_dir,
+        artist=artist,
+        title=title,
+        lyrics_file=lyrics_file,
+        disable_web_lyrics=args.disable_web_lyrics,
+    )
+    print("Done.")
+    print(f"Output directory: {out_dir}")
+
+
+if __name__ == "__main__":
+    main()
