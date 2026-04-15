@@ -41,7 +41,10 @@ python lyrics_structure_pipeline.py "/path/to/song.mp3" \
 ### Output files
 
 - `structure.png` – waveform with colorized sections
+- `structure_player.html` – interactive waveform player with clickable section blocks
 - `markers.csv` – section markers with source tags
 - `markers.cue` – CUE markers
 - `summary.txt` – short time-based summary
 - `lyrics_metadata.json` – provider/debug metadata
+
+Open `structure_player.html` in a browser to play audio and jump by section.

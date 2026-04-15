@@ -13,10 +13,12 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 
 import librosa
 import matplotlib.pyplot as plt
@@ -708,6 +710,291 @@ def plot_structure(y: np.ndarray, sr: int, segments: list[AudioSegment], output_
     plt.close(fig)
 
 
+def write_interactive_player_html(
+    audio_path: Path, out_dir: Path, segments: list[AudioSegment], metadata: dict[str, Any]
+) -> None:
+    """Write a standalone interactive waveform player HTML."""
+    if not segments:
+        return
+
+    audio_rel = os.path.relpath(audio_path, out_dir).replace("\\", "/")
+    audio_src = quote(audio_rel, safe="/")
+
+    palette = [
+        "#7cb342",
+        "#fdd835",
+        "#26a69a",
+        "#ab47bc",
+        "#42a5f5",
+        "#ff7043",
+        "#8d6e63",
+        "#ef5350",
+    ]
+    labels = list(dict.fromkeys(seg.label for seg in segments))
+    label_colors = {label: palette[idx % len(palette)] for idx, label in enumerate(labels)}
+
+    segment_payload = [
+        {
+            "start": round(seg.start, 3),
+            "end": round(seg.end, 3),
+            "label": seg.label,
+            "source": seg.label_source,
+            "color": label_colors[seg.label],
+        }
+        for seg in segments
+    ]
+    metadata_payload = {
+        "artist": metadata.get("artist"),
+        "title": metadata.get("title"),
+        "lyrics_provider": metadata.get("lyrics_provider"),
+        "labeling_mode": metadata.get("labeling_mode"),
+    }
+
+    html = f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Structure Player - {audio_path.name}</title>
+  <style>
+    :root {{
+      --bg: #101217;
+      --panel: #191d26;
+      --text: #e7ebf3;
+      --muted: #a9b1c5;
+      --accent: #4fc3f7;
+      --border: #2a3140;
+    }}
+    body {{
+      margin: 0;
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Ubuntu, Cantarell, Noto Sans, Arial, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+    }}
+    .wrap {{
+      max-width: 1200px;
+      margin: 20px auto 40px;
+      padding: 0 16px;
+    }}
+    .panel {{
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 14px;
+      margin-bottom: 14px;
+    }}
+    h1 {{
+      margin: 0 0 10px;
+      font-size: 20px;
+    }}
+    .meta {{
+      color: var(--muted);
+      font-size: 13px;
+      margin-bottom: 10px;
+    }}
+    #waveform {{
+      width: 100%;
+      border-radius: 8px;
+      overflow: hidden;
+      background: #0f1320;
+    }}
+    .controls {{
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      margin-top: 12px;
+      flex-wrap: wrap;
+    }}
+    button {{
+      border: 1px solid var(--border);
+      background: #1f2633;
+      color: var(--text);
+      border-radius: 8px;
+      padding: 8px 12px;
+      cursor: pointer;
+    }}
+    button:hover {{
+      border-color: #3b4558;
+    }}
+    .time {{
+      color: var(--muted);
+      font-variant-numeric: tabular-nums;
+    }}
+    .section-bar {{
+      display: flex;
+      width: 100%;
+      height: 54px;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      overflow: hidden;
+      margin-top: 10px;
+      background: #111520;
+    }}
+    .section {{
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 12px;
+      font-weight: 700;
+      color: #111;
+      cursor: pointer;
+      border-right: 1px solid rgba(0,0,0,0.22);
+      user-select: none;
+      text-align: center;
+      padding: 2px 4px;
+      min-width: 20px;
+    }}
+    .section:hover {{
+      filter: brightness(1.06);
+    }}
+    .hint {{
+      margin-top: 8px;
+      color: var(--muted);
+      font-size: 12px;
+    }}
+    table {{
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 13px;
+    }}
+    th, td {{
+      border-bottom: 1px solid var(--border);
+      padding: 8px;
+      text-align: left;
+      font-variant-numeric: tabular-nums;
+    }}
+    th {{
+      color: var(--muted);
+      font-weight: 600;
+    }}
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="panel">
+      <h1>Interactive Structure Player</h1>
+      <div class="meta" id="meta"></div>
+      <div id="waveform"></div>
+      <div class="controls">
+        <button id="playPause">Play</button>
+        <button id="backward">-5s</button>
+        <button id="forward">+5s</button>
+        <span class="time"><span id="currentTime">00:00.000</span> / <span id="duration">--:--.---</span></span>
+      </div>
+      <div class="section-bar" id="sectionBar"></div>
+      <div class="hint">Click a colored section block to jump playback.</div>
+    </div>
+    <div class="panel">
+      <table>
+        <thead>
+          <tr>
+            <th>Section</th>
+            <th>Start</th>
+            <th>End</th>
+            <th>Source</th>
+          </tr>
+        </thead>
+        <tbody id="tableBody"></tbody>
+      </table>
+    </div>
+  </div>
+
+  <script src="https://unpkg.com/wavesurfer.js@7/dist/wavesurfer.min.js"></script>
+  <script>
+    const audioSrc = {json.dumps(audio_src)};
+    const segments = {json.dumps(segment_payload, ensure_ascii=False)};
+    const meta = {json.dumps(metadata_payload, ensure_ascii=False)};
+
+    const formatTime = (sec) => {{
+      if (!Number.isFinite(sec)) return "--:--.---";
+      const mm = Math.floor(sec / 60);
+      const ss = Math.floor(sec % 60);
+      const ms = Math.round((sec - Math.floor(sec)) * 1000);
+      return `${{String(mm).padStart(2, "0")}}:${{String(ss).padStart(2, "0")}}.${{String(ms).padStart(3, "0")}}`;
+    }};
+
+    const wave = WaveSurfer.create({{
+      container: "#waveform",
+      url: audioSrc,
+      waveColor: "#98a5bf",
+      progressColor: "#4fc3f7",
+      cursorColor: "#ffeb3b",
+      height: 230,
+      barWidth: 2,
+      barGap: 1,
+      normalize: true,
+      dragToSeek: true
+    }});
+
+    const playPauseButton = document.getElementById("playPause");
+    const backwardButton = document.getElementById("backward");
+    const forwardButton = document.getElementById("forward");
+    const currentTimeEl = document.getElementById("currentTime");
+    const durationEl = document.getElementById("duration");
+    const sectionBarEl = document.getElementById("sectionBar");
+    const tableBody = document.getElementById("tableBody");
+    const metaEl = document.getElementById("meta");
+
+    metaEl.textContent = `Artist: ${{meta.artist || "Unknown"}} | Title: ${{meta.title || "Unknown"}} | Provider: ${{meta.lyrics_provider || "n/a"}} | Mode: ${{meta.labeling_mode || "n/a"}}`;
+
+    const totalDuration = segments.length ? segments[segments.length - 1].end : 0;
+    const safeDuration = Math.max(totalDuration, 0.001);
+
+    const seekTo = (sec) => {{
+      if (!Number.isFinite(sec)) return;
+      const ratio = Math.max(0, Math.min(1, sec / safeDuration));
+      wave.seekTo(ratio);
+    }};
+
+    segments.forEach((segment) => {{
+      const width = Math.max(1.0, ((segment.end - segment.start) / safeDuration) * 100);
+      const block = document.createElement("div");
+      block.className = "section";
+      block.style.width = `${{width}}%`;
+      block.style.background = segment.color;
+      block.title = `${{segment.label}}  ${{formatTime(segment.start)}} - ${{formatTime(segment.end)}}`;
+      block.textContent = segment.label;
+      block.addEventListener("click", () => seekTo(segment.start));
+      sectionBarEl.appendChild(block);
+
+      const tr = document.createElement("tr");
+      tr.innerHTML = `
+        <td>${{segment.label}}</td>
+        <td>${{formatTime(segment.start)}}</td>
+        <td>${{formatTime(segment.end)}}</td>
+        <td>${{segment.source}}</td>
+      `;
+      tr.style.cursor = "pointer";
+      tr.addEventListener("click", () => seekTo(segment.start));
+      tableBody.appendChild(tr);
+    }});
+
+    playPauseButton.addEventListener("click", () => wave.playPause());
+    backwardButton.addEventListener("click", () => seekTo(Math.max(0, wave.getCurrentTime() - 5)));
+    forwardButton.addEventListener("click", () => seekTo(wave.getCurrentTime() + 5));
+
+    wave.on("ready", () => {{
+      durationEl.textContent = formatTime(wave.getDuration());
+    }});
+    wave.on("timeupdate", (t) => {{
+      currentTimeEl.textContent = formatTime(t);
+    }});
+    wave.on("play", () => {{
+      playPauseButton.textContent = "Pause";
+    }});
+    wave.on("pause", () => {{
+      playPauseButton.textContent = "Play";
+    }});
+    wave.on("finish", () => {{
+      playPauseButton.textContent = "Play";
+    }});
+  </script>
+</body>
+</html>
+"""
+    (out_dir / "structure_player.html").write_text(html, encoding="utf-8")
+
+
 def write_outputs(
     audio_path: Path,
     out_dir: Path,
@@ -750,6 +1037,7 @@ def write_outputs(
     (out_dir / "lyrics_metadata.json").write_text(
         json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8"
     )
+    write_interactive_player_html(audio_path, out_dir, segments, metadata)
 
 
 def run_pipeline(
