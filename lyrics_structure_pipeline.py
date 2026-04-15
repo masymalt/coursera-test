@@ -659,20 +659,33 @@ def plot_structure(y: np.ndarray, sr: int, segments: list[AudioSegment], output_
     y_min, y_max = float(np.min(y)), float(np.max(y))
     y_range = max(1e-6, y_max - y_min)
 
-    plt.figure(figsize=(16, 4.5))
-    plt.plot(times, y, color="black", linewidth=0.55, alpha=0.8)
+    fig, ax = plt.subplots(figsize=(16, 4.5))
+    ax.plot(times, y, color="black", linewidth=0.55, alpha=0.8)
 
     labels_order = list(dict.fromkeys(seg.label for seg in segments))
     cmap = plt.get_cmap("tab20")
     color_map = {label: cmap(i % 20) for i, label in enumerate(labels_order)}
 
+    # Draw a dedicated colored label band below the waveform.
+    band_gap = 0.04 * y_range
+    band_height = 0.24 * y_range
+    band_top = y_min - band_gap
+    band_bottom = band_top - band_height
+
     for seg in segments:
         color = color_map[seg.label]
-        plt.axvspan(seg.start, seg.end, color=color, alpha=0.3, linewidth=0)
+        ax.fill_between(
+            [seg.start, seg.end],
+            [band_bottom, band_bottom],
+            [band_top, band_top],
+            color=color,
+            alpha=0.8,
+            linewidth=0,
+        )
         mid = (seg.start + seg.end) / 2.0
-        plt.text(
+        ax.text(
             mid,
-            y_min + 0.15 * y_range,
+            (band_bottom + band_top) / 2.0,
             seg.label,
             ha="center",
             va="center",
@@ -681,13 +694,15 @@ def plot_structure(y: np.ndarray, sr: int, segments: list[AudioSegment], output_
             color="black",
         )
 
-    plt.title("Song structure (audio + lyrics)")
-    plt.xlabel("Time (sec)")
-    plt.ylabel("Amplitude")
-    plt.xlim(0, duration_sec)
-    plt.tight_layout()
-    plt.savefig(output_png, dpi=160)
-    plt.close()
+    ax.axhline(y=band_top, color="black", linewidth=0.6, alpha=0.7)
+    ax.set_title("Song structure (audio + lyrics)")
+    ax.set_xlabel("Time (sec)")
+    ax.set_ylabel("Amplitude")
+    ax.set_xlim(0, duration_sec)
+    ax.set_ylim(band_bottom - 0.05 * y_range, y_max + 0.05 * y_range)
+    fig.tight_layout()
+    fig.savefig(output_png, dpi=160)
+    plt.close(fig)
 
 
 def write_outputs(
