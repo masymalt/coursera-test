@@ -154,6 +154,13 @@ def parse_lrc_timed_lines(text: str) -> list[TimedLyricLine]:
     return lines
 
 
+def normalize_lyric_text(text: str) -> str:
+    cleaned = text.lower()
+    cleaned = re.sub(r"[^a-z0-9а-яё\s]", " ", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    return cleaned
+
+
 def build_intervals_from_timed_lyrics(
     timed_lines: list[TimedLyricLine], duration_sec: float
 ) -> list[SectionInterval]:
@@ -170,6 +177,66 @@ def build_intervals_from_timed_lyrics(
         end = starts[idx + 1][0] if idx + 1 < len(starts) else duration_sec
         if end > start:
             intervals.append(SectionInterval(start=start, end=end, label=label))
+    return intervals
+
+
+def infer_chorus_intervals_from_repetition(
+    timed_lines: list[TimedLyricLine], duration_sec: float
+) -> list[SectionInterval]:
+    """Infer chorus-like intervals from repeated synchronized lyric lines.
+
+    Useful when LRC has timings but no explicit section tags.
+    """
+    normalized: list[tuple[float, str]] = []
+    for line in timed_lines:
+        token = normalize_lyric_text(line.text)
+        if token and len(token) >= 8:
+            normalized.append((line.time_sec, token))
+    if not normalized:
+        return []
+
+    counts: dict[str, int] = {}
+    for _, token in normalized:
+        counts[token] = counts.get(token, 0) + 1
+
+    repeated_anchor_times = sorted(
+        [time_sec for time_sec, token in normalized if counts.get(token, 0) >= 2]
+    )
+    if len(repeated_anchor_times) < 2:
+        return []
+
+    groups: list[list[float]] = [[repeated_anchor_times[0]]]
+    for time_sec in repeated_anchor_times[1:]:
+        if time_sec - groups[-1][-1] <= 14.0:
+            groups[-1].append(time_sec)
+        else:
+            groups.append([time_sec])
+
+    intervals: list[SectionInterval] = []
+    for group in groups:
+        if len(group) < 2:
+            continue
+        start = max(0.0, group[0] - 2.0)
+        end = min(duration_sec, group[-1] + 10.0)
+        if end - start >= 8.0:
+            intervals.append(SectionInterval(start=start, end=end, label="chorus"))
+    return intervals
+
+
+def build_lyric_presence_intervals(
+    timed_lines: list[TimedLyricLine], duration_sec: float
+) -> list[SectionInterval]:
+    non_empty = [line for line in timed_lines if normalize_lyric_text(line.text)]
+    if not non_empty:
+        return []
+
+    intervals: list[SectionInterval] = []
+    for idx, line in enumerate(non_empty):
+        next_time = non_empty[idx + 1].time_sec if idx + 1 < len(non_empty) else duration_sec
+        gap = max(1.0, min(8.0, next_time - line.time_sec))
+        end = min(duration_sec, line.time_sec + gap)
+        if end > line.time_sec:
+            intervals.append(SectionInterval(start=line.time_sec, end=end, label="voice"))
     return intervals
 
 
@@ -418,6 +485,28 @@ def apply_timed_lyrics_labels(
     return changed
 
 
+def apply_verse_labels_from_lyric_presence(
+    segments: list[AudioSegment], lyric_presence: list[SectionInterval]
+) -> bool:
+    if not lyric_presence:
+        return False
+
+    changed = False
+    for seg in segments:
+        if seg.label in {"chorus", "intro", "outro"}:
+            continue
+        overlap = sum(
+            overlap_seconds(seg.start, seg.end, interval.start, interval.end)
+            for interval in lyric_presence
+        )
+        if overlap / max(seg.duration, 1e-6) >= 0.35:
+            seg.label = "verse"
+            if seg.label_source == "audio":
+                seg.label_source = "lyrics_inferred"
+            changed = True
+    return changed
+
+
 def apply_plain_lyrics_sequence_labels(segments: list[AudioSegment], section_seq: list[str]) -> bool:
     if not section_seq or len(segments) < 2:
         return False
@@ -609,8 +698,18 @@ def run_pipeline(
         timed_intervals = build_intervals_from_timed_lyrics(timed_lines, duration_sec)
         metadata["timed_lyrics_found"] = bool(timed_lines)
         metadata["section_tags_found"] = bool(timed_intervals)
-        if apply_timed_lyrics_labels(segments, timed_intervals):
-            used_lyrics = True
+        if timed_intervals:
+            if apply_timed_lyrics_labels(segments, timed_intervals):
+                used_lyrics = True
+        elif timed_lines:
+            chorus_intervals = infer_chorus_intervals_from_repetition(timed_lines, duration_sec)
+            if chorus_intervals and apply_timed_lyrics_labels(segments, chorus_intervals):
+                used_lyrics = True
+                metadata["section_tags_found"] = True
+                metadata["inferred_sections_from_repetition"] = True
+            lyric_presence = build_lyric_presence_intervals(timed_lines, duration_sec)
+            if apply_verse_labels_from_lyric_presence(segments, lyric_presence):
+                used_lyrics = True
 
     if not used_lyrics and plain_text:
         section_seq = extract_section_sequence_from_plain_lyrics(plain_text)
