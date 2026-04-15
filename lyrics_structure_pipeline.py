@@ -590,6 +590,69 @@ def merge_adjacent_same_labels(segments: list[AudioSegment]) -> list[AudioSegmen
     return merged
 
 
+def refine_edge_section_labels(
+    segments: list[AudioSegment],
+    intro_max_sec: float = 18.0,
+    outro_max_sec: float = 15.0,
+    short_tail_sec: float = 10.0,
+) -> None:
+    """Normalize edge labels for cleaner DAW-friendly marker output.
+
+    Rules:
+    - First generic section_* within intro_max_sec -> intro
+    - If intro is already present, the next short generic section near start -> intro
+    - Last generic section_* within outro_max_sec -> outro
+    - Very short trailing verse/pre_chorus -> outro
+    - If outro is present, very short preceding verse/pre_chorus -> outro
+    """
+    if not segments:
+        return
+
+    first = segments[0]
+    if first.label.startswith("section_") and first.end <= intro_max_sec:
+        first.label = "intro"
+        if first.label_source == "audio":
+            first.label_source = "postprocess"
+
+    if len(segments) >= 2:
+        second = segments[1]
+        if (
+            segments[0].label == "intro"
+            and second.label.startswith("section_")
+            and second.end <= intro_max_sec
+        ):
+            second.label = "intro"
+            if second.label_source == "audio":
+                second.label_source = "postprocess"
+
+    last = segments[-1]
+    if last.label.startswith("section_") and last.duration <= outro_max_sec:
+        last.label = "outro"
+        if last.label_source == "audio":
+            last.label_source = "postprocess"
+    elif last.label in {"verse", "pre_chorus"} and last.duration <= short_tail_sec:
+        last.label = "outro"
+        if last.label_source in {"audio", "lyrics_inferred"}:
+            last.label_source = "postprocess"
+
+    # Optional pass: if there is a generic section immediately before outro and it is tiny,
+    # collapse it into outro as well.
+    if len(segments) >= 2:
+        prev = segments[-2]
+        if segments[-1].label == "outro" and prev.label.startswith("section_") and prev.duration <= short_tail_sec:
+            prev.label = "outro"
+            if prev.label_source == "audio":
+                prev.label_source = "postprocess"
+        elif (
+            segments[-1].label == "outro"
+            and prev.label in {"verse", "pre_chorus"}
+            and prev.duration <= short_tail_sec
+        ):
+            prev.label = "outro"
+            if prev.label_source in {"audio", "lyrics_inferred"}:
+                prev.label_source = "postprocess"
+
+
 def plot_structure(y: np.ndarray, sr: int, segments: list[AudioSegment], output_png: Path) -> None:
     duration_sec = len(y) / sr
     times = np.linspace(0, duration_sec, num=len(y))
@@ -740,6 +803,8 @@ def run_pipeline(
             used_lyrics = True
 
     smooth_short_islands(segments)
+    segments = merge_adjacent_same_labels(segments)
+    refine_edge_section_labels(segments)
     segments = merge_adjacent_same_labels(segments)
 
     if used_lyrics:
