@@ -6,6 +6,7 @@ from typing import Iterable
 import requests
 from flask import Flask, jsonify, render_template, request
 from mutagen import File as MutagenFile
+from mutagen import MutagenError
 
 WIKIMEDIA_API_URL = "https://commons.wikimedia.org/w/api.php"
 ALLOWED_EXTENSIONS = {".mp3"}
@@ -24,7 +25,11 @@ def _first_non_empty(tag_source: dict[str, list[str]], keys: Iterable[str]) -> s
 
 def extract_artist_and_title(file_storage) -> tuple[str | None, str | None]:
     file_storage.stream.seek(0)
-    audio = MutagenFile(file_storage.stream, easy=True)
+    try:
+        audio = MutagenFile(file_storage.stream, easy=True)
+    except MutagenError:
+        file_storage.stream.seek(0)
+        return None, None
     file_storage.stream.seek(0)
 
     tags: dict[str, list[str]] = getattr(audio, "tags", {}) or {}

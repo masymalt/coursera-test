@@ -16,10 +16,10 @@
 ## Запуск
 
 ```bash
-python -m venv .venv
+python3 -m venv .venv
 source .venv/bin/activate
-pip install -r requirements.txt
-python app.py
+python3 -m pip install -r requirements.txt
+python3 app.py
 ```
 
 Откройте в браузере: `http://127.0.0.1:5000`
