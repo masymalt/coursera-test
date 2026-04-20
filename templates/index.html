@@ -1,0 +1,38 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Распознавание MP3</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}" />
+</head>
+<body>
+  <main class="container">
+    <h1>Распознавание MP3</h1>
+    <p class="description">
+      Загрузите MP3-файл, чтобы определить исполнителя и название песни.
+      После распознавания отобразятся 5 фотографий исполнителя.
+    </p>
+
+    <form id="upload-form" class="upload-form">
+      <label for="audio_file">MP3-файл</label>
+      <input id="audio_file" name="audio_file" type="file" accept=".mp3,audio/mpeg" required />
+      <button id="submit-button" type="submit">Распознать</button>
+    </form>
+
+    <section id="status" class="status" aria-live="polite"></section>
+
+    <section id="result" class="result hidden">
+      <h2>Результат</h2>
+      <p><strong>Исполнитель:</strong> <span id="artist-name"></span></p>
+      <p><strong>Песня:</strong> <span id="song-title"></span></p>
+
+      <div>
+        <h3>Фотографии исполнителя</h3>
+        <div id="gallery" class="gallery"></div>
+      </div>
+    </section>
+  </main>
+  <script src="{{ url_for('static', filename='app.js') }}"></script>
+</body>
+</html>
